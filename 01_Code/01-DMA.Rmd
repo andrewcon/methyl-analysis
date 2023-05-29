@@ -1,0 +1,357 @@
+---
+author: "Andrei-Emil Constantinescu"
+date: "2023-05-03"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(warning = FALSE, echo = TRUE)
+```
+
+
+```{r loadingPackages, warning = FALSE, message = FALSE, echo = FALSE}
+# Set working directory to location of the file
+setwd(dirname(rstudioapi::getSourceEditorContext()$path))
+
+# Set seed for reproducibility
+set.seed(20230526)
+
+# Function to download and convert harmonizome link to data frame
+gene_get <- function(url) {
+  # Download the JSON data from the URL
+  response <- GET(url)
+  
+  # Check if the request was successful
+  if(http_type(response) == "application/octet-stream") {
+    # Parse the JSON content
+    my_content <- httr::content(response, "text", encoding = "UTF-8")
+    json_data <- fromJSON(my_content)
+    
+    # Extract the 'associations' part of the JSON data
+    associations <- json_data$associations
+    
+    return(associations$gene$symbol)
+  } else {
+    print("Request failed.")
+  }
+}
+
+# Load packages function. If not found, install, then load.
+process_packages <- function(package_names) {
+  for (package_name in package_names) {
+    if (!requireNamespace(package_name, quietly = TRUE)) {
+      message("Package '", package_name, "' is not installed. Installing now...")
+      install.packages(package_name)
+    }
+    library(package_name, character.only = TRUE)
+  }
+}
+
+#### Install packages and load them ####
+packageVec <- c("data.table", "tidyverse", "ggpubr", "xlsx", 
+                "BiocManager", "biomaRt", "httr", "jsonlite",
+                "pheatmap", "ggrepel")
+process_packages(packageVec)
+
+#### Install and load Bioconductor packages
+# Load packages function. If not found, install, then load.
+process_packages_bioC <- function(package_names) {
+  for (package_name in package_names) {
+    if (!requireNamespace(package_name, quietly = TRUE)) {
+      message("Package '", package_name, "' is not installed. Installing now...")
+      BiocManager::install(package_name)
+    }
+    library(package_name, character.only = TRUE)
+  }
+}
+
+#### Install BioC packages and load them ####
+packageVec_bioC <- c("limma", "GenomicRanges", "ChIPseeker", "TxDb.Hsapiens.UCSC.hg19.knownGene")
+process_packages_bioC(packageVec_bioC)
+
+```
+
+## Preparing the Taskheet datasets
+
+
+```{r dataPrep}
+# Loading beta values matrix
+beta_values <- as.matrix(fread("b.csv"), rownames=1)
+
+# Loading phenotype table
+phenotypes <- fread("p.csv")
+
+```
+
+## Answer to Question 1)
+
+Performing the differential methylation analysis
+```{r DMA}
+# Convert Drug to a factor
+phenotypes$Drug <- as.factor(phenotypes$Drug)
+# Treat Vehicle as baseline and Treatment as drug
+phenotypes$Drug <- relevel(phenotypes$Drug, ref = "Vehicle")
+
+# Create design matrix
+design <- model.matrix(~ Drug, data = phenotypes)
+
+# define offset so it doesn't give an error if trying to log 0
+offset <- 0.01
+
+# Create a new matrix 
+beta_values_M <- beta_values
+
+# Apply the formula to each element of the matrix
+beta_values_M[] <- log2((beta_values + offset) / (1 - beta_values + offset))
+
+# Perform differential methylation analysis using limma
+fit <- lmFit(beta_values, design)
+fit <- eBayes(fit)
+differential_cpgs <- topTable(fit, coef = 2, adjust.method = "BH", sort.by = "P", number = Inf)
+
+# Funnel plot seems to indicate heteroscedasticity in both M values and beta values
+# So using beta-values because they are easier to interpret
+plot(differential_cpgs$logFC, differential_cpgs$M, xlab="LogFC", ylab="AveExpr")
+
+
+# Extract differentially methylated CpGs
+differential_cpgs <- subset(differential_cpgs, adj.P.Val < 0.05)
+differential_cpgs <- as.data.table(differential_cpgs, keep.rownames = TRUE)
+
+# Print the results
+print(paste0(differential_cpgs$rn, collapse = ", "))
+
+```
+
+## Answer to Question 2)
+
+```{r gene_retrieval}
+# Choose the human dataset
+mart <- useMart(biomart = "ENSEMBL_MART_ENSEMBL",
+                dataset = "hsapiens_gene_ensembl")
+
+# Extract the chr and bp positions from the rn column
+differential_cpgs[, c("chr", "bp_start", "bp_end") := tstrsplit(rn, ':|-', fixed=FALSE)]
+differential_cpgs[, `:=` (bp_start = as.integer(bp_start), bp_end = as.integer(bp_end))]
+# Add a 'gene' column with NA values by default
+differential_cpgs[, "gene" := NA]
+
+# Get the list of all genes with their locations
+genes <- getBM(attributes = c('chromosome_name', 'start_position', 'end_position', 
+                              'external_gene_name', 'description'), mart = mart)
+
+# Ensure the chromosome naming in the genes dataset is consistent with differential_cpgs
+genes$chromosome_name <- paste0("chr", genes$chromosome_name)
+
+# Convert to GRanges object
+genes_gr <- makeGRangesFromDataFrame(df = genes,
+                                     seqnames.field = "chromosome_name",
+                                     start.field = "start_position",
+                                     end.field = "end_position")
+
+# Create GRanges object for CpG sites
+cpg_gr <- makeGRangesFromDataFrame(df = differential_cpgs,
+                                   seqnames.field = "chr",
+                                   start.field = "bp_start",
+                                   end.field = "bp_end")
+
+# Find nearest genes to CpGs
+nearest_genes <- nearest(cpg_gr, genes_gr)
+
+# Initialize a new column 'gene' with NA
+differential_cpgs[, gene := NA]
+
+# Assign gene names to the CpGs based on nearest_genes
+differential_cpgs[, gene := genes$external_gene_name[nearest_genes]][gene == "", gene := NA]
+
+# Want to see if the mock Drug affects genes encoding for proteins associated with the
+# extracellular matrix
+# Connecting to Harmonizome and downloading from Reactome genes 
+# associated with the ECM
+ecm_genes <- gene_get("https://maayanlab.cloud/Harmonizome/api/1.0/gene_set/extracellular+matrix/COMPARTMENTS+Curated+Protein+Localization+Evidence+Scores")
+
+# Filter to include only ECM genes in the differential_cpgs data
+differential_cpgs <- differential_cpgs[gene %in% ecm_genes,]
+
+# Genes are the differentially methylated CpGs located in genes:
+print(paste0("Differentially methylated CpGs within ECM genes: ", 
+             paste0(sort(unique(differential_cpgs$gene)), collapse = ", ")))
+
+```
+```{r feature_types, echo=FALSE}
+# Could also use ChIPseeker with txdb
+# This gives more info
+# Define the API endpoint
+gr <- GRanges(seqnames = gsub("chr", "", differential_cpgs$chr),
+              ranges = IRanges(start = differential_cpgs$bp_start,
+                               end = differential_cpgs$bp_end))
+
+# This will download the file if it is not already present
+# Quite useful to have reference files already in the database
+# so don't need to download every time
+txdb <- makeTxDbFromBiomart(biomart="ensembl", dataset="hsapiens_gene_ensembl")
+
+# Annotate the peaks
+peakAnno <- annotatePeak(gr, tssRegion=c(-3000, 3000), TxDb=txdb, annoDb="org.Hs.eg.db")
+# Convert the GRanges object to a data frame
+peakAnno_df <- as.data.table(as.data.frame(as(peakAnno, "DataFrame")))
+# Create rn column so can merge with differential_cpgs
+peakAnno_df[, rn := paste0("chr", X.seqnames, ":", X.start, "-", X.end)]
+# Merge with with differential_cpgs
+differential_cpgs <- merge(differential_cpgs, peakAnno_df[, c("rn", "X.annotation")], by="rn")
+setnames(differential_cpgs, "X.annotation", "feature_type")
+```
+
+## Answer to Question 3)
+
+```{r heatmap_prep, fig.width=10,fig.height=11}
+## Create heatmap from the base data frames
+# Transform beta_values to data.table
+beta_values_melt <- as.data.table(beta_values, keep.rownames = TRUE)
+
+# Melt from wide to lond
+beta_values_melt <- melt(beta_values_melt, id.vars= "rn", measure = patterns("^sample"), 
+                         value.name = c("beta"), variable.name = "SampleID")
+
+# Merge with phenotypes data.table
+phenotypes_betas <- merge(phenotypes, beta_values_melt, by="SampleID")
+
+# Keep only rows relevant from the differential analysis and CpGs within ECM genes
+phenotypes_relevant <- phenotypes_betas[rn %in% differential_cpgs$rn, ]
+phenotypes_relevant[, c("chr", "bp_start", "bp_end") := tstrsplit(rn, ':|-', fixed=FALSE)]
+phenotypes_relevant <- phenotypes_relevant[order(SampleID, rn)]
+
+# Pivot the data to wide format
+beta_matrix <- dcast(phenotypes_relevant, rn ~ SampleID, value.var = "beta")
+beta_matrix <- as.data.frame(beta_matrix)
+
+# The first column contains the CpG names, so let's move it to rownames
+rownames(beta_matrix) <- beta_matrix$rn
+beta_matrix$rn <- NULL
+
+# Convert to matrix
+beta_matrix <- as.matrix(beta_matrix)
+
+# Create a unique data frame for sample annotation
+unique_samples <- as.data.frame(unique(phenotypes_relevant[,c('SampleID', 'Drug')]))
+rownames(unique_samples) <- unique_samples$SampleID
+unique_samples <- unique_samples[, 2, drop=FALSE]
+
+# Create a unique data frame for CpG annotation
+unique_cpg <- as.data.frame(unique(phenotypes_relevant[,c('rn', 'chr')]))
+rownames(unique_cpg) <- unique_cpg$rn
+unique_cpg$chr <- as.character(unique_cpg$chr)
+unique_cpg <- unique_cpg[, 2, drop=FALSE]
+
+# Define a color range for the heatmap
+color <- colorRampPalette(c("navy", "white", "firebrick3"))(50)
+
+## Generate the heatmap
+# Can see quite well that the Treatment works
+png(file="../02_Figures/figure_1.png", res = 300, units = "mm",
+    width = 250, height = 250) 
+pheatmap(beta_matrix,
+         annotation_col = unique_samples,
+         annotation_row = unique_cpg,
+         cluster_rows = FALSE,
+         cluster_cols = TRUE, cutree_cols = 2,
+         color = color, show_colnames = FALSE,
+         annotation_colors = list(Treatment = c("Vehicle" = "grey", "Treatment" = "black")),
+         annotation_legend = TRUE, main = "Heatmap of % methylation as beta value") 
+invisible(dev.off())
+
+```
+
+```{r heatmap_plot, fig.width=10,fig.height=11}
+pheatmap(beta_matrix,
+         annotation_col = unique_samples,
+         annotation_row = unique_cpg,
+         cluster_rows = FALSE,
+         cluster_cols = TRUE, cutree_cols = 2,
+         color = color, show_colnames = FALSE,
+         annotation_colors = list(Treatment = c("Vehicle" = "grey", "Treatment" = "black")),
+         annotation_legend = TRUE, main = "Heatmap of % methylation as beta value") 
+```
+
+```{r volcano_plot}
+## Volcano plot from the CpG differential analysis summary statistics
+differential_cpgs$neglog10p <- -log10(differential_cpgs$adj.P.Val)
+
+# Get gene counts
+gene_count <- table(differential_cpgs$gene)
+gene_count <- as.data.frame.table(gene_count)
+colnames(gene_count) <- c("gene", "count")
+
+# Add gene counts to the main data frame
+differential_cpgs <- merge(differential_cpgs, gene_count, by = "gene")
+
+# Get gene counts
+# Subset of data for genes appearing once or twice
+label_data <- differential_cpgs[differential_cpgs$count %in% c(1, 2, 3), ]
+
+# Generate volcano plot
+cpg_vplot <- ggplot(differential_cpgs, aes(x = logFC, y = neglog10p)) +
+  geom_point(alpha = 0.6, size = 2, aes(color = gene)) +
+  geom_text_repel(data = label_data,
+                  aes(label = gene),
+                  size = 3,
+                  box.padding = unit(0.35, "lines"),
+                  point.padding = unit(0.3, "lines"),
+                  force = 2, min.segment.length = 0) +
+  geom_text_repel(data = differential_cpgs[differential_cpgs$logFC == min(differential_cpgs$logFC),],
+                  aes(label = rn),size = 3) +
+  xlab("Log2 Fold Change") +
+  ylab("-Log10 P-value") +
+  ggtitle("Volcano plot of CpG Methylation") +
+  theme_minimal()
+
+png(file="../02_Figures/figure_2.png", res = 300, units = "mm",
+    width = 180, height = 110) 
+cpg_vplot
+invisible(dev.off())
+
+cpg_vplot
+
+```
+
+
+## Some info on the identified genes
+
+ADAMTS1: This gene encodes a protein that is part of the ADAMTS (a disintegrin and metalloproteinase with thrombospondin motifs) family. These proteins cleave proteoglycans, which are part of the extracellular matrix (ECM). The ADAMTS proteins, including the one encoded by ADAMTS1, are also involved in angiogenesis (the formation of new blood vessels), with some members having anti-angiogenic activity. The expression of ADAMTS1 is known to be regulated by methylation.
+
+
+COL1A1: This gene encodes the pro-alpha1 chains of type I collagen, whose triple helix comprises two alpha1 chains and one alpha2 chain. Type I collagen is a key structural protein in the ECM of various tissues, including skin, bone, and tendon. Methylation changes in this gene could alter the production of type I collagen, influencing the structure and mechanical properties of the ECM in these tissues. Gene Ontology (GO) from GeneCards Gene Ontology showed evidence of ECM process association e.g. enables extracellular matrix structural constituent, enables extracellular matrix structural constituent conferring tensile strength.
+
+
+COL20A1: This gene codes for type XX collagen, a member of the FACIT collagen family (Fibril Associated Collagens with Interrupted Triple helices). Unlike fibril-forming collagens like COL1A1, FACIT collagens associate with the surface of collagen fibrils, playing a role in fibril formation and stabilization. Changes in COL20A1 methylation and thus its expression could impact collagen fibril formation and ECM stability. Interestingly, it looks like SNPs from GWAS in this gene associate with smoking status, smoking initiation and smoking frequency.
+
+
+COL6A1: This gene encodes one of the three alpha chains of type VI collagen, which form a widespread and versatile network within the ECM, contributing to the coherence of tissue structure and cellular functions. Alterations in the methylation status of this gene could therefore impact ECM organization and tissue function.
+
+
+LTBP4: The protein encoded by this gene is part of the large latent complex that forms with transforming growth factor beta (TGF-beta). TGF-beta is crucial for ECM deposition and homeostasis, and the LTBPs (Latent transforming growth factor beta-binding proteins) are thought to maintain TGF-beta in a latent state in the ECM until it's needed. Changes in methylation and expression of LTBP4 could influence TGFB availability and thus ECM formation and remodeling.
+
+
+MMP17: This gene encodes a member of the matrix metalloproteinase (MMP) family. MMPs are involved in the breakdown of ECM in normal physiological processes, such as embryonic development, reproduction, tissue remodeling, and disease processes, such as arthritis and metastasis. Changes in MMP17 methylation and expression could impact the balance of ECM synthesis and degradation.
+
+
+The CpG sites identified here were either in promoter regions or less than 1kb away from a promoter region. This provides  evidence that Treatment might lead to changes in expression of ECM genes, although additional analyses such as those listed above would allow for testing any hypothesis generated from this analysis.
+
+
+Treatment leads to decreased methylation of CpG sites within these genes. The fact that there is decreased methylation in these ECM-related genes implies that the mock Drug might be influencing ECM-related processes. The precise impact depends on how this methylation change affects gene expression and therefore protein function. Usually, methylation leads to decreased gene expression, while demethylation leads to higher gene expression. The fact that the CpG sites are in promoter regions or close to promoters means that there's a good chance that the Drug has a phenotypic effect.
+
+
+## Conclusions
+
+i. Gene Expression Data: Methylation is a regulatory mechanism that can influence gene expression. Therefore, obtaining RNA-seq data from the same samples and correlating changes in methylation with changes in gene expression could provide more comprehensive insights.
+
+ii. Protein-level data: Mass spectrometry could be used to identify changes in protein expression corresponding to the changes in gene expression and methylation.
+
+iii. Histone Modification Data: The methylation status of DNA is often interconnected with the status of histone modifications. Chromatin Immunoprecipitation followed by sequencing (ChIP-seq) could be used to study changes in histone modifications in response to the compound.
+
+iv. Genetic Variants: If there are SNPs or other genetic variants within the regions of differential methylation, they may interact with the methylation status. Whole-genome sequencing data could be used to map how SNPs could affect methylation status. These could then be integrated into a colocalization analysis with SNP expression.
+
+v. Functional Assays: Functional assays such as cell proliferation, apoptosis, or migration assays could be performed for validation of computational analyses.
+
+vi. Beta-values and M-values are both ways of representing methylation data, but they each have pros and cons. M-values are the log2 of Beta-values, which helps to mitigate the issue of heteroscedasticity i.e. increasing variance with increasing expression value. This makes M-values more statistically robust for differential methylation analysis, and they are generally preferred for this purpose. In my case, I did not observe a large improvement from converting the betas to M, but this might not hold for all analyses. In general, for biological interpretations and plots, I'd use beta-values. For statistical analyses, I'd use M values. 
+
